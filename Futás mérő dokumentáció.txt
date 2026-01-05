@@ -1,0 +1,43 @@
+RFID Alapú Futóverseny Időmérő Rendszer – Műszaki Dokumentáció
+1. A projekt célja
+A projekt célja egy automatizált, érintésmentes időmérő rendszer létrehozása futóversenyekhez UHF (Ultra High Frequency) RFID technológia segítségével. A rendszer képes a futók áthaladását érzékelni, az egyedi azonosítójukat (chip) leolvasni, és az áthaladás pontos idejét naplózni.
+A megoldás két fő komponensből áll:
+1.	Beágyazott rendszer (ESP32): A hardveres vezérlésért és az RFID modullal való kommunikációért felel.
+2.	PC oldali szoftver (Python): Az adatok fogadását, szűrését, feldolgozását és mentését végzi.
+________________________________________
+2. Hardver vezérlés: futas_meroesp32.ino
+Ez a programkód fut az ESP32 mikrokontrolleren. A feladata a híd szerep betöltése az UHF olvasó modul és a számítógép között.
+Működési elv:
+A kód C++ nyelven, Arduino környezetben készült. A rendszer soros kommunikációt (UART) használ.
+•	Inicializálás (setup): A rendszer indításakor a mikrokontroller felépíti a kapcsolatot az RFID modullal a 16-os (RX) és 17-es (TX) lábakon keresztül, 115200 baud sebességgel.
+•	Jelerősség beállítása: A program egyik legfontosabb eleme, hogy indításkor egy speciális parancssorozattal (AA 00 B6...) 26 dBm-re (maximális teljesítményre) állítja az antennát.
+o	Miért szükséges ez? Alapértelmezetten a modulok alacsony teljesítményen indulnak (kb. 10-20 cm olvasási távolság). A versenykörnyezetben szükséges 3-5 méteres olvasási távolság eléréséhez szoftveresen felül kell írni a gyári beállítást.
+•	Folyamatos olvasás (loop): A mikrokontroller ciklikusan küldi az olvasási parancsot (cmdRead) a modulnak.
+•	Adattovábbítás: Amint a modul érzékel egy kártyát, a nyers adatot (HEX formátumban) azonnal továbbítja az USB porton keresztül a számítógépnek.
+•	Visszajelzés: A rendszer egy passzív zümmögőt (buzzer) is vezérel, amely sikeres olvasáskor hangjelzést ad, segítve a telepítést és a működés ellenőrzését.
+________________________________________
+3. Adatfeldolgozó szoftver: futas_mero.py
+Ez a Python nyelven írt alkalmazás fut a laptopon. Feladata a beérkező, nehezen olvasható nyers adatok értelmezése és rendszerezése.
+A kód felépítése és funkciói:
+•	Soros port figyelése: A program a pyserial könyvtárat használja a bejövő adatfolyam folyamatos olvasására.
+•	Adattisztítás és Szűrés (adat_tisztitas függvény): Az RFID olvasó sok "szemetet" (státuszüzeneteket, üres válaszokat) küld. A program kiszűri a túl rövid üzeneteket.
+•	Protokoll értelmezés: A kód keresi a szabványos EPC Gen2 fejlécet (3000). Ez a bitsorozat jelzi, hogy érvényes kártyaadat következik.
+o	Miért így csináljuk? Ez teszi lehetővé, hogy bármilyen szabványos UHF kártyát (rajtszámot) felismerjen a rendszer, függetlenül attól, hogy mi van ráírva. A program a fejléc utáni 24 karaktert (12 bájtot) emeli ki, ami a futó egyedi azonosítója.
+•	Időbélyegzés: A sikeres azonosítás pillanatában a rendszer lekéri a számítógép pontos idejét (datetime.now), és ezt rendeli hozzá a futóhoz.
+________________________________________
+4. Adattárolás: futas_eredmeny.txt
+A program egy egyszerű, könnyen kezelhető szöveges fájlba menti az eredményeket.
+Fájlstruktúra:
+Az adatbázis felépítése CSV-kompatibilis (pontosvesszővel elválasztott): ÓÓ:PP:MP;KÁRTYA_AZONOSÍTÓ
+Példa a kimenetre: 13:45:10;E2 80 69 15 00 00 50 1D 63 E5 C4 D6
+Miért ezt a formátumot választottuk?
+1.	Biztonság: A fájlhoz folyamatosan („append” módban) fűzi hozzá az új adatokat, így áramszünet vagy programleállás esetén sem vesznek el a korábbi eredmények.
+2.	Kompatibilitás: Ez a formátum közvetlenül, konvertálás nélkül beolvasható Excelbe, ahol a verseny végén a chip-azonosítók könnyedén összerendelhetők a futók neveivel (pl. FKERES függvénnyel).
+________________________________________
+5. Összegzés
+A rendszer egy költséghatékony, de ipari szabványokat követő megoldás. A feladatok szétosztása (az ESP32 végzi a hardveres kommunikációt, a PC az adatfeldolgozást) biztosítja a rendszer stabilitását és gyorsaságát. A szoftveres jelerősség-állításnak köszönhetően a rendszer alkalmas valós versenykörülmények közötti használatra.
+
+Készítették: 
+Lénárt Attila Adrián Neptun kód: F7DSGG
+Mester Imre Miklós Neptun kód: MCU92H
+Májer Balázs Neptun kód: XYIFJl
