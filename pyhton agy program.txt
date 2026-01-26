@@ -1,0 +1,498 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+import serial
+import serial.tools.list_ports
+import threading
+import time
+from datetime import datetime, timedelta
+import os
+import csv
+
+# --- KONFIGURÁCIÓ ---
+ADATBAZIS_NEV = "/home/futasgep/Desktop/verseny_adatbazis.db"
+MIN_KOR_IDO = 10  # Másodperc
+
+class VersenyApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RFID Futóverseny Központ - VÁLTÓ FINAL + ELLENŐRZŐ")
+        self.root.geometry("1200x780")
+        
+        style = ttk.Style()
+        style.configure("Treeview.Heading", font=('Arial', 10, 'bold'))
+        style.configure("Treeview", font=('Arial', 10), rowheight=25)
+
+        self.soros_kapcsolat = None
+        self.olvasas_fut = False
+        self.tanitas_aktiv = False 
+        self.ellenorzes_aktiv = False 
+        self.tanitas_cel_id = None 
+        self.palya_hossz = tk.DoubleVar(value=400.0)
+        self.van_tavolsag = tk.BooleanVar(value=True) 
+        self.utolso_olvasasok = {} 
+        self.utolso_mentes_ideje = 0 
+
+        self.adatbazis_init()
+
+        self.tab_control = ttk.Notebook(root)
+        self.tab_verseny = ttk.Frame(self.tab_control)
+        self.tab_versenyzok = ttk.Frame(self.tab_control)
+        self.tab_ellenorzes = ttk.Frame(self.tab_control)
+        self.tab_chipek = ttk.Frame(self.tab_control)
+        self.tab_beallitasok = ttk.Frame(self.tab_control)
+
+        self.tab_control.add(self.tab_verseny, text=' ⏱️ VERSENY MONITOR ')
+        self.tab_control.add(self.tab_versenyzok, text=' 👤 Versenyzők ')
+        self.tab_control.add(self.tab_ellenorzes, text=' 🔍 CHIP ELLENŐRZÉS ')
+        self.tab_control.add(self.tab_chipek, text=' 🛠️ CHIPEK TANÍTÁSA ')
+        self.tab_control.add(self.tab_beallitasok, text=' ⚙️ Beállítások ')
+        self.tab_control.pack(expand=1, fill="both")
+
+        self.tab_control.bind("<<NotebookTabChanged>>", self.fulek_valtasakor)
+
+        self.felepites_verseny_tab()
+        self.felepites_versenyzok_tab()
+        self.felepites_ellenorzes_tab()
+        self.felepites_chipek_tab()
+        self.felepites_beallitasok_tab()
+
+        self.status_var = tk.StringVar()
+        self.status_var.set("Rendszer kész.")
+        self.statusbar = tk.Label(root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W, bg="#e1e1e1")
+        self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def fulek_valtasakor(self, event):
+        current_tab = self.tab_control.index(self.tab_control.select())
+        if current_tab == 1: self.frissit_versenyzo_tab()
+        elif current_tab == 3: self.frissit_chip_tab()
+
+    # --- ADATBÁZIS (JAVÍTOTT SOROK) ---
+    def adatbazis_init(self):
+        mappa = os.path.dirname(ADATBAZIS_NEV)
+        # ITT VOLT A HIBA - Kijavítva:
+        if not os.path.exists(mappa):
+            try:
+                os.makedirs(mappa)
+            except:
+                pass
+
+        conn = sqlite3.connect(ADATBAZIS_NEV)
+        c = conn.cursor()
+        
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS chipek (
+                id INTEGER PRIMARY KEY, 
+                chip_szam INTEGER UNIQUE, 
+                hex_kod TEXT
+            )
+        """)
+        
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS versenyzok (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                nev TEXT, 
+                kategoria TEXT, 
+                chip_id INTEGER, 
+                rogzites_ideje TIMESTAMP, 
+                aktiv INTEGER DEFAULT 1, 
+                kezdes_ido TEXT, 
+                vegzes_ido TEXT, 
+                FOREIGN KEY(chip_id) REFERENCES chipek(chip_szam)
+            )
+        """)
+        
+        for col in ['rogzites_ideje', 'aktiv', 'kezdes_ido', 'vegzes_ido']:
+            try: c.execute(f"SELECT {col} FROM versenyzok LIMIT 1")
+            except: 
+                try: c.execute(f"ALTER TABLE versenyzok ADD COLUMN {col} TEXT"); conn.commit()
+                except: pass
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS eredmenyek (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                versenyzo_id INTEGER, 
+                kor_szam INTEGER, 
+                ido_belyeg TIMESTAMP, 
+                kor_ido REAL, 
+                sebesseg REAL
+            )
+        """)
+        
+        c.execute("SELECT count(*) FROM chipek")
+        if c.fetchone()[0] == 0:
+            for i in range(1, 26): c.execute("INSERT INTO chipek (chip_szam, hex_kod) VALUES (?, NULL)", (i,))
+            conn.commit()
+        conn.close()
+
+    # --- 1. VERSENY FÜL ---
+    def felepites_verseny_tab(self):
+        self.lbl_status_big = tk.Label(self.tab_verseny, text="A MÉRÉS ÁLL", bg="#dc3545", fg="white", font=("Arial", 16, "bold"), pady=10)
+        self.lbl_status_big.pack(fill=tk.X)
+
+        frame_top = tk.Frame(self.tab_verseny, pady=10, bg="#dddddd")
+        frame_top.pack(fill=tk.X)
+        
+        tk.Button(frame_top, text="▶️ START", bg="#28a745", fg="white", font=("Arial", 12, "bold"), width=10, command=self.start_race).pack(side=tk.LEFT, padx=10)
+        tk.Button(frame_top, text="⏹️ STOP", bg="#dc3545", fg="white", font=("Arial", 12, "bold"), width=10, command=self.stop_reading).pack(side=tk.LEFT, padx=5)
+        
+        # KÉT MENTÉS GOMB
+        frame_save = tk.Frame(frame_top, bg="#dddddd")
+        frame_save.pack(side=tk.RIGHT, padx=10)
+        tk.Button(frame_save, text="💾 RÉSZLETES (Minden kör)", bg="#007bff", fg="white", font=("Arial", 9, "bold"), command=self.mentes_reszletes_csv).pack(side=tk.TOP, pady=2, fill=tk.X)
+        tk.Button(frame_save, text="📊 ÖSSZESÍTETT (Vége)", bg="#17a2b8", fg="white", font=("Arial", 9, "bold"), command=self.mentes_osszesitett_csv).pack(side=tk.TOP, pady=2, fill=tk.X)
+        
+        frame_mid = tk.Frame(frame_top, bg="#dddddd")
+        frame_mid.pack(side=tk.LEFT, padx=20)
+        tk.Checkbutton(frame_mid, text="Táv mérése:", variable=self.van_tavolsag, bg="#dddddd", font=("Arial", 11, "bold")).pack(side=tk.LEFT)
+        tk.Entry(frame_mid, textvariable=self.palya_hossz, width=6, font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        tk.Label(frame_mid, text="méter", bg="#dddddd").pack(side=tk.LEFT)
+
+        cols = ('Hely', 'Név', 'Körök', 'Utolsó Áthaladás', 'Kör Idő', 'Sebesség (km/h)')
+        self.tree_verseny = ttk.Treeview(self.tab_verseny, columns=cols, show='headings', height=20)
+        for col in cols: self.tree_verseny.heading(col, text=col); self.tree_verseny.column(col, width=130, anchor=tk.CENTER)
+        self.tree_verseny.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def mentes_reszletes_csv(self):
+        fajl_nev = f"RESZLETES_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        utvonal = f"/home/futasgep/Desktop/{fajl_nev}"
+        try:
+            conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+            sql = """SELECT v.nev, e.kor_szam, e.ido_belyeg, e.kor_ido, e.sebesseg 
+                     FROM eredmenyek e JOIN versenyzok v ON e.versenyzo_id = v.id 
+                     ORDER BY v.nev, e.kor_szam ASC"""
+            c.execute(sql); adatok = c.fetchall()
+            with open(utvonal, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f, delimiter=';'); writer.writerow(["Név", "Kör Száma", "Kör Kezdete", "Kör Vége", "Kör Idő (mp)", "Sebesség (km/h)"])
+                for sor in adatok:
+                    nev, kor, veg_ido_str, ido_sec, seb = sor
+                    veg_ido_dt = datetime.strptime(veg_ido_str, "%Y-%m-%d %H:%M:%S.%f")
+                    if ido_sec:
+                        start_ido_dt = veg_ido_dt - timedelta(seconds=ido_sec)
+                        start_str = start_ido_dt.strftime("%H:%M:%S")
+                    else: start_str = "-"
+                    writer.writerow([nev, kor, start_str, veg_ido_dt.strftime("%H:%M:%S"), round(ido_sec, 2) if ido_sec else 0, round(seb, 2) if seb else 0])
+            conn.close(); messagebox.showinfo("Siker", f"Részletes mentve:\n{fajl_nev}")
+        except Exception as e: messagebox.showerror("Hiba", f"Hiba: {e}")
+
+    def mentes_osszesitett_csv(self):
+        fajl_nev = f"OSSZESITETT_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        utvonal = f"/home/futasgep/Desktop/{fajl_nev}"
+        try:
+            conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+            sql = """SELECT v.nev, v.kategoria, count(e.id) as ossz_kor, sum(e.kor_ido) as ossz_ido 
+                     FROM versenyzok v 
+                     LEFT JOIN eredmenyek e ON v.id = e.versenyzo_id 
+                     GROUP BY v.id 
+                     ORDER BY ossz_kor DESC"""
+            c.execute(sql); adatok = c.fetchall()
+            with open(utvonal, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f, delimiter=';'); writer.writerow(["Név", "Kategória", "Összes Kör", "Összes Idő (mp)", "Összes Idő (Óra:Perc:Mp)"])
+                for sor in adatok:
+                    nev, kat, korok, ido_sec = sor
+                    if not ido_sec: ido_sec = 0
+                    ido_szep = str(timedelta(seconds=int(ido_sec)))
+                    writer.writerow([nev, kat, korok, round(ido_sec, 2), ido_szep])
+            conn.close(); messagebox.showinfo("Siker", f"Összesített mentve:\n{fajl_nev}")
+        except Exception as e: messagebox.showerror("Hiba", f"Hiba: {e}")
+
+    # --- 2. VERSENYZŐK FÜL ---
+    def felepites_versenyzok_tab(self):
+        frame_add = tk.LabelFrame(self.tab_versenyzok, text="Versenyző Hozzáadása")
+        frame_add.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(frame_add, text="Név:").grid(row=0, column=0, padx=5, pady=5)
+        self.entry_nev = tk.Entry(frame_add, width=20)
+        self.entry_nev.grid(row=0, column=1, padx=5)
+        
+        tk.Label(frame_add, text="Kat:").grid(row=0, column=2, padx=5)
+        self.entry_kat = tk.Entry(frame_add, width=10)
+        self.entry_kat.grid(row=0, column=3, padx=5)
+
+        tk.Label(frame_add, text="Chip:").grid(row=0, column=4, padx=5)
+        self.combo_chip = ttk.Combobox(frame_add, state="readonly", width=5)
+        self.combo_chip.grid(row=0, column=5, padx=5)
+        
+        tk.Label(frame_add, text="KÉZI IDŐ (Pl. 9:00):", fg="#6f42c1").grid(row=1, column=0, columnspan=2, sticky=tk.E, padx=5, pady=5)
+        self.entry_start_fix = tk.Entry(frame_add, width=10)
+        self.entry_start_fix.grid(row=1, column=2, padx=5)
+        tk.Label(frame_add, text=" -ig (Pl. 10:00):", fg="#6f42c1").grid(row=1, column=3, padx=5)
+        self.entry_end_fix = tk.Entry(frame_add, width=10)
+        self.entry_end_fix.grid(row=1, column=4, padx=5)
+
+        self.btn_mentes = tk.Button(frame_add, text="💾 Mentés", command=self.versenyzo_mentese, bg="#007bff", fg="white", font=("Arial", 10, "bold"))
+        self.btn_mentes.grid(row=0, column=6, rowspan=2, padx=15, sticky="ns")
+
+        frame_del = tk.Frame(self.tab_versenyzok)
+        frame_del.pack(fill=tk.X, padx=10, pady=5)
+        tk.Button(frame_del, text="🗑️ KIVÁLASZTOTT TÖRLÉSE", command=self.versenyzo_torlese, bg="#dc3545", fg="white").pack(side=tk.RIGHT, padx=5)
+        tk.Button(frame_del, text="⚠️ ÖSSZES TÖRLÉSE", command=self.adatbazis_reset, bg="orange").pack(side=tk.RIGHT, padx=5)
+
+        self.tree_users = ttk.Treeview(self.tab_versenyzok, columns=('Név', 'Kat', 'Chip', 'Időszak'), show='headings')
+        self.tree_users.heading('Név', text='Név'); self.tree_users.heading('Kat', text='Kat')
+        self.tree_users.heading('Chip', text='Chip'); self.tree_users.heading('Időszak', text='Státusz / Idő')
+        self.tree_users.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.frissit_versenyzo_tab()
+
+    def frissit_versenyzo_tab(self):
+        for i in self.tree_users.get_children(): self.tree_users.delete(i)
+        conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+        c.execute("SELECT nev, kategoria, chip_id, aktiv, kezdes_ido, vegzes_ido FROM versenyzok")
+        for row in c.fetchall():
+            nev, kat, chip, aktiv, kezd, veg = row
+            if aktiv == 1: status = "🟢 ÉLŐ (FUT)"
+            else: status = f"🏁 {kezd} - {veg}"
+            self.tree_users.insert('', tk.END, values=(nev, kat, chip, status))
+        
+        c.execute("SELECT chip_szam FROM chipek WHERE hex_kod IS NOT NULL AND chip_szam NOT IN (SELECT chip_id FROM versenyzok WHERE aktiv=1)")
+        szabadok = [str(r[0]) for r in c.fetchall()]
+        self.combo_chip['values'] = szabadok
+        if szabadok: self.combo_chip.current(0)
+        else: self.combo_chip.set('')
+        conn.close()
+
+    def versenyzo_mentese(self):
+        most = time.time()
+        if most - self.utolso_mentes_ideje < 2.0: return 
+        self.utolso_mentes_ideje = most
+        nev = self.entry_nev.get().strip(); kat = self.entry_kat.get().strip(); chip = self.combo_chip.get()
+        start_fix = self.entry_start_fix.get().strip(); end_fix = self.entry_end_fix.get().strip()
+
+        if not nev or not chip: messagebox.showwarning("Hiány", "Név és Chip kitöltése kötelező!"); return
+
+        if start_fix:
+            if len(start_fix) == 4: start_fix = "0" + start_fix
+            if len(start_fix) == 5: start_fix += ":00"
+        if end_fix:
+            if len(end_fix) == 4: end_fix = "0" + end_fix
+            if len(end_fix) == 5: end_fix += ":00"
+
+        conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+        c.execute("SELECT count(*) FROM versenyzok WHERE chip_id=?", (chip,))
+        hasznalva_volt = c.fetchone()[0] > 0
+        if (not start_fix or not end_fix) and hasznalva_volt:
+             messagebox.showerror("Váltó Hiba", "Ez a chip már használatban van!\nÚj versenyzőhöz KÖTELEZŐ megadni a kézi időt!"); conn.close(); return
+
+        if start_fix and end_fix:
+            is_active = 0
+            try:
+                ma_str = datetime.now().strftime("%Y-%m-%d")
+                uj_start = datetime.strptime(f"{ma_str} {start_fix}", "%Y-%m-%d %H:%M:%S")
+                uj_end = datetime.strptime(f"{ma_str} {end_fix}", "%Y-%m-%d %H:%M:%S")
+                diff = (uj_end - uj_start).total_seconds()
+                if diff <= 0: messagebox.showerror("Hiba", "A befejezés legyen későbbi!"); conn.close(); return
+
+                c.execute("SELECT kezdes_ido, vegzes_ido FROM versenyzok WHERE chip_id=? AND aktiv=0", (chip,))
+                for row in c.fetchall():
+                    s_str, e_str = row
+                    if s_str and e_str:
+                        db_start = datetime.strptime(f"{ma_str} {s_str}", "%Y-%m-%d %H:%M:%S")
+                        db_end = datetime.strptime(f"{ma_str} {e_str}", "%Y-%m-%d %H:%M:%S")
+                        if (uj_start < db_end) and (uj_end > db_start):
+                            messagebox.showerror("ÜTKÖZÉS", f"Ez az időszak már foglalt ezen a chipen!\n({s_str} - {e_str})"); conn.close(); return
+            except ValueError: messagebox.showerror("Hiba", "Idő formátum hiba! Helyes: 09:00"); conn.close(); return
+        else: is_active = 1
+
+        c.execute("INSERT INTO versenyzok (nev, kategoria, chip_id, rogzites_ideje, aktiv, kezdes_ido, vegzes_ido) VALUES (?,?,?,?,?,?,?)", 
+                  (nev, kat, chip, datetime.now(), is_active, start_fix, end_fix))
+        new_id = c.lastrowid
+        
+        if is_active == 0:
+            sebesseg = 0
+            if self.van_tavolsag.get(): sebesseg = (self.palya_hossz.get() / diff) * 3.6
+            ts_str = uj_end.strftime("%Y-%m-%d %H:%M:%S.%f")
+            c.execute("INSERT INTO eredmenyek (versenyzo_id, kor_szam, ido_belyeg, kor_ido, sebesseg) VALUES (?,?,?,?,?)",
+                      (new_id, 1, ts_str, diff, sebesseg))
+            messagebox.showinfo("Siker", f"{nev} rögzítve!\n{start_fix} - {end_fix}")
+
+        conn.commit(); conn.close()
+        self.frissit_versenyzo_tab(); self.frissit_monitor()
+        self.entry_nev.delete(0, tk.END); self.entry_kat.delete(0, tk.END)
+        self.entry_start_fix.delete(0, tk.END); self.entry_end_fix.delete(0, tk.END)
+
+    # --- 3. CHIP ELLENŐRZÉS ---
+    def felepites_ellenorzes_tab(self):
+        frame_mid = tk.Frame(self.tab_ellenorzes, pady=30); frame_mid.pack()
+        tk.Label(frame_mid, text="Húzd el a chipet az olvasó előtt!", font=("Arial", 14)).pack(pady=10)
+        self.btn_check = tk.Button(frame_mid, text="🔍 SCAN (OLVASÁS)", bg="#6f42c1", fg="white", font=("Arial", 16, "bold"), command=self.ellenorzes_inditasa)
+        self.btn_check.pack(pady=10, ipadx=20, ipady=10)
+
+        frame_result = tk.LabelFrame(self.tab_ellenorzes, text="Eredmény", font=("Arial", 12))
+        frame_result.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        self.lbl_check_nev = tk.Label(frame_result, text="Név: -", font=("Arial", 14, "bold"), fg="#007bff"); self.lbl_check_nev.pack(pady=5)
+        self.lbl_check_kat = tk.Label(frame_result, text="Kategória: -", font=("Arial", 12)); self.lbl_check_kat.pack(pady=5)
+        self.lbl_check_chip = tk.Label(frame_result, text="Chip ID: -", font=("Arial", 12)); self.lbl_check_chip.pack(pady=5)
+        self.lbl_check_status = tk.Label(frame_result, text="Státusz: -", font=("Arial", 12)); self.lbl_check_status.pack(pady=5)
+
+    def ellenorzes_inditasa(self):
+        if not self.soros_kapcsolat: messagebox.showerror("Hiba", "Nincs kapcsolat az olvasóval!"); return
+        self.ellenorzes_aktiv = True
+        self.lbl_check_nev.config(text="OLVASÁS...", fg="orange")
+        self.status_var.set("Ellenőrzés: Húzd el a chipet...")
+
+    # --- 4. CHIPEK TANÍTÁSA ---
+    def felepites_chipek_tab(self):
+        frame_info = tk.Frame(self.tab_chipek, pady=10); frame_info.pack(fill=tk.X)
+        tk.Button(frame_info, text="📡 SCAN (TANÍTÁS)", command=self.tanitas_inditasa, bg="#6f42c1", fg="white", font=("Arial", 11, "bold")).pack(pady=5)
+        self.tree_chipek = ttk.Treeview(self.tab_chipek, columns=('Szám', 'Állapot', 'HEX Kód'), show='headings', height=25)
+        self.tree_chipek.heading('Szám', text='Chip Szám'); self.tree_chipek.heading('Állapot', text='Állapot'); self.tree_chipek.heading('HEX Kód', text='Fizikai Kód')
+        self.tree_chipek.pack(fill=tk.BOTH, expand=True, padx=10, pady=10); self.frissit_chip_tab()
+
+    def frissit_chip_tab(self):
+        for i in self.tree_chipek.get_children(): self.tree_chipek.delete(i)
+        conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+        c.execute("SELECT chip_szam, hex_kod FROM chipek ORDER BY chip_szam")
+        for row in c.fetchall():
+            szam, kod = row; status = "✅ TANÍTVA" if kod else "❌ ÜRES"
+            self.tree_chipek.insert('', tk.END, values=(szam, status, kod if kod else "-"))
+        conn.close()
+
+    def felepites_beallitasok_tab(self):
+        frame = tk.LabelFrame(self.tab_beallitasok, text="Kapcsolat"); frame.pack(fill=tk.X, padx=10, pady=10)
+        self.combo_ports = ttk.Combobox(frame, width=30); self.combo_ports.pack(side=tk.LEFT, padx=5, pady=10)
+        tk.Button(frame, text="Keresés", command=self.port_kereses).pack(side=tk.LEFT)
+        tk.Button(frame, text="CSATLAKOZÁS", command=self.soros_csatlakozas).pack(side=tk.LEFT, padx=10)
+
+    def loop(self):
+        buffer = ""
+        while True:
+            if not self.olvasas_fut and not self.tanitas_aktiv and not self.ellenorzes_aktiv: time.sleep(0.1); continue
+            try:
+                if self.soros_kapcsolat and self.soros_kapcsolat.in_waiting:
+                    raw = self.soros_kapcsolat.read(self.soros_kapcsolat.in_waiting).decode(errors='ignore')
+                    buffer += raw
+                    if '\n' in buffer:
+                        lines = buffer.split('\n'); buffer = lines[-1]
+                        for line in lines[:-1]: self.feldolgoz(line)
+            except: pass
+            time.sleep(0.01)
+
+    def feldolgoz(self, line):
+        line = line.strip().replace(" ", "").upper()
+        idx = line.find("3000")
+        if idx != -1 and len(line) > idx + 28:
+            epc = line[idx+4 : idx+28]
+            
+            if self.tanitas_aktiv:
+                conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+                c.execute("UPDATE chipek SET hex_kod=? WHERE chip_szam=?", (epc, self.tanitas_cel_id))
+                conn.commit(); conn.close(); self.tanitas_aktiv = False
+                self.root.after(0, lambda: messagebox.showinfo("Siker", f"Chip rögzítve!"))
+                self.root.after(0, self.frissit_chip_tab); return
+            
+            if self.ellenorzes_aktiv:
+                conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+                c.execute("SELECT chip_szam FROM chipek WHERE hex_kod=?", (epc,))
+                res = c.fetchone()
+                
+                info_nev = "ISMERETLEN / ÜRES"; info_kat = "-"; info_chip = "Nincs az adatbázisban"; info_status = "-"
+
+                if res:
+                    chip_szam = res[0]; info_chip = str(chip_szam)
+                    c.execute("SELECT nev, kategoria, aktiv, kezdes_ido, vegzes_ido FROM versenyzok WHERE chip_id=? ORDER BY id DESC LIMIT 1", (chip_szam,))
+                    res2 = c.fetchone()
+                    if res2:
+                        nev, kat, aktiv, kezd, veg = res2
+                        info_nev = nev; info_kat = kat
+                        if aktiv == 1: info_status = "🟢 ÉLŐ (FUT)"
+                        else: info_status = f"🏁 LEFUTVA ({kezd}-{veg})"
+                    else: info_nev = "SZABAD CHIP (Nincs név)"
+                conn.close()
+                
+                def update_ui():
+                    self.lbl_check_nev.config(text=f"Név: {info_nev}", fg="#007bff" if "SZABAD" not in info_nev else "green")
+                    self.lbl_check_kat.config(text=f"Kategória: {info_kat}")
+                    self.lbl_check_chip.config(text=f"Chip ID: {info_chip}")
+                    self.lbl_check_status.config(text=f"Státusz: {info_status}")
+                    self.status_var.set("Ellenőrzés kész.")
+                self.root.after(0, update_ui); self.ellenorzes_aktiv = False; return
+
+            if self.olvasas_fut: self.verseny_mentes_rfid(epc)
+
+    def verseny_mentes_rfid(self, hex_kod):
+        conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+        c.execute("SELECT chip_szam FROM chipek WHERE hex_kod=?", (hex_kod,))
+        res = c.fetchone()
+        if res:
+            chip_szam = res[0]
+            c.execute("SELECT id, nev FROM versenyzok WHERE chip_id=? AND aktiv=1 LIMIT 1", (chip_szam,))
+            res2 = c.fetchone()
+            if res2:
+                pid, nev = res2; most = time.time()
+                if chip_szam in self.utolso_olvasasok:
+                    if most - self.utolso_olvasasok[chip_szam] < MIN_KOR_IDO: conn.close(); return
+                self.utolso_olvasasok[chip_szam] = most
+                c.execute("SELECT count(*) FROM eredmenyek WHERE versenyzo_id=?", (pid,))
+                kor = c.fetchone()[0] + 1
+                sebesseg, kor_ido = 0, 0
+                if kor > 1:
+                    c.execute("SELECT ido_belyeg FROM eredmenyek WHERE versenyzo_id=? ORDER BY id DESC LIMIT 1", (pid,))
+                    prev_ts = datetime.strptime(c.fetchone()[0], "%Y-%m-%d %H:%M:%S.%f").timestamp()
+                    kor_ido = most - prev_ts
+                    if self.van_tavolsag.get(): sebesseg = (self.palya_hossz.get() / kor_ido) * 3.6
+                ts_str = datetime.fromtimestamp(most).strftime("%Y-%m-%d %H:%M:%S.%f")
+                c.execute("INSERT INTO eredmenyek (versenyzo_id, kor_szam, ido_belyeg, kor_ido, sebesseg) VALUES (?,?,?,?,?)",
+                          (pid, kor, ts_str, kor_ido, sebesseg))
+                conn.commit(); self.root.after(0, self.frissit_monitor)
+        conn.close()
+
+    def frissit_monitor(self):
+        for i in self.tree_verseny.get_children(): self.tree_verseny.delete(i)
+        conn = sqlite3.connect(ADATBAZIS_NEV); c = conn.cursor()
+        sql = """SELECT v.nev, count(e.id), max(e.ido_belyeg), sum(e.kor_ido), e.sebesseg
+                 FROM versenyzok v JOIN eredmenyek e ON v.id = e.versenyzo_id
+                 GROUP BY v.id ORDER BY count(e.id) DESC, max(e.ido_belyeg) ASC"""
+        c.execute(sql)
+        for i, row in enumerate(c.fetchall()):
+            nev, kor, utolso, ossz, seb = row; utolso_ido = utolso[11:19]
+            if not self.van_tavolsag.get(): seb = 0
+            self.tree_verseny.insert('', tk.END, values=(i+1, nev, kor, utolso_ido, round(ossz, 2) if ossz else 0, round(seb, 2)))
+        conn.close()
+
+    def versenyzo_torlese(self):
+        sel = self.tree_users.selection()
+        if not sel: messagebox.showwarning("Hiba", "Jelölj ki valakit!"); return
+        nev = self.tree_users.item(sel[0])['values'][0]
+        if messagebox.askyesno("Törlés", f"Biztosan törlöd: {nev}?"):
+            conn = sqlite3.connect(ADATBAZIS_NEV)
+            cursor = conn.execute("SELECT id FROM versenyzok WHERE nev=?", (nev,))
+            res = cursor.fetchone()
+            if res:
+                pid = res[0]
+                conn.execute("DELETE FROM eredmenyek WHERE versenyzo_id=?", (pid,))
+                conn.execute("DELETE FROM versenyzok WHERE id=?", (pid,))
+                conn.commit()
+            conn.close(); self.frissit_versenyzo_tab(); self.frissit_monitor()
+
+    def adatbazis_reset(self):
+        if messagebox.askyesno("Törlés", "Minden adat törlődik!"):
+            conn = sqlite3.connect(ADATBAZIS_NEV); conn.execute("DELETE FROM eredmenyek"); conn.execute("DELETE FROM versenyzok")
+            conn.commit(); conn.close(); self.frissit_versenyzo_tab(); self.frissit_monitor()
+
+    def tanitas_inditasa(self):
+        sel = self.tree_chipek.selection()
+        if not sel: messagebox.showwarning("Hiba", "Válassz ki egy sort!"); return
+        if not self.soros_kapcsolat: messagebox.showerror("Hiba", "Nincs kapcsolat!"); return
+        self.tanitas_cel_id = self.tree_chipek.item(sel[0])['values'][0]
+        messagebox.showinfo("Tanítás", f"Húzd el a {self.tanitas_cel_id}-es chipet!"); self.tanitas_aktiv = True
+
+    def port_kereses(self):
+        ports = serial.tools.list_ports.comports()
+        self.combo_ports['values'] = [p.device for p in ports]
+        if self.combo_ports['values']: self.combo_ports.current(0)
+
+    def soros_csatlakozas(self):
+        try:
+            self.soros_kapcsolat = serial.Serial(self.combo_ports.get(), 115200, timeout=0.1)
+            messagebox.showinfo("Siker", "Csatlakozva!"); threading.Thread(target=self.loop, daemon=True).start()
+        except Exception as e: messagebox.showerror("Hiba", str(e))
+
+    def start_race(self):
+        if self.soros_kapcsolat: 
+            self.olvasas_fut = True; self.lbl_status_big.config(text="A VERSENY ZAJLIK (MÉRÉS AKTÍV)", bg="#28a745"); self.status_var.set("MÉRÉS AKTÍV")
+    def stop_reading(self): 
+        self.olvasas_fut = False; self.lbl_status_big.config(text="A MÉRÉS ÁLL", bg="#dc3545"); self.status_var.set("Mérés leállítva.")
+
+if __name__ == "__main__":
+    root = tk.Tk(); app = VersenyApp(root); root.mainloop()
